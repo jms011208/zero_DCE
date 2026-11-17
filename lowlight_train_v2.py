@@ -9,6 +9,7 @@
      (곡선이 노이즈를 같이 증폭하기 때문에 e_noisy에는 "밝기 증폭으로 커진 노이즈"가 자연스럽게 생긴다)
   3) 신경망이 e_noisy(+gain 맵)로부터 노이즈 마스크 M과 잔차 R을 예측해 out = e_noisy - M*R 을 만든다.
   4) 손실:  L1(out, e_clean)  +  lam_mask * MSE(M, 실제 노이즈 크기 맵)
+     (선택) --lam_edge: 경계 픽셀의 L1 가중치를 키움, --lam_grad: 출력/정답의 Sobel 기울기 차이 손실 추가 -> 경계 흐림 방지
      - 일부 배치(p_clean)는 노이즈를 넣지 않아서, 노이즈가 없는 곳은 건드리지 않도록 같이 학습한다.
 """
 import argparse
@@ -43,6 +44,45 @@ def mask_target(e_noisy, e_clean, scale, pool=5):
     d = (e_noisy - e_clean).abs().mean(1, keepdim=True)
     d = F.avg_pool2d(d, pool, 1, pool // 2, count_include_pad=False)
     return (d * scale).clamp(0.0, 1.0)
+
+
+def luma(x):
+    """RGB -> 밝기(휘도). 경계는 대부분 밝기에 있다."""
+    return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+
+def sobel_xy(y):
+    """Sobel 기울기 (gx, gy). 8로 나눠서 '이웃 픽셀 간 밝기 차이' 정도의 크기로 맞춘다."""
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=y.dtype, device=y.device).view(1, 1, 3, 3) / 8.0
+    p = F.pad(y, (1, 1, 1, 1), mode="replicate")
+    return F.conv2d(p, kx), F.conv2d(p, kx.transpose(2, 3))
+
+
+def edge_weight_map(target, ref=0.05):
+    """정답 이미지에서 경계를 찾아 0(평평) ~ 1(뚜렷한 경계) 맵으로 만든다. (N,1,H,W)
+    ref=0.05는 이웃 픽셀 간 밝기 차이가 약 0.1 이상인 경계를 1로 본다."""
+    y = F.avg_pool2d(luma(target), 3, 1, 1, count_include_pad=False)
+    gx, gy = sobel_xy(y)
+    return ((gx ** 2 + gy ** 2).sqrt() / ref).clamp(0.0, 1.0)
+
+
+def recon_loss(out, target, lam_edge=0.0, lam_grad=0.0):
+    """복원 손실 = (경계 가중) L1 + lam_grad * 기울기 손실.
+    lam_edge: 경계 픽셀의 L1 가중치를 (1 + lam_edge)배로 키운다 -> 경계를 깎으면 손해가 커진다.
+    lam_grad: 출력과 정답의 Sobel 기울기 차이(L1) -> 경계의 날카로움 자체를 맞춘다.
+    둘 다 0이면 기존과 같은 단순 L1이다."""
+    d = (out - target).abs()
+    if lam_edge > 0:
+        w = 1.0 + lam_edge * edge_weight_map(target)
+        l_rec = (w * d).sum() / w.expand_as(d).sum()
+    else:
+        l_rec = d.mean()
+    l_grad = out.new_zeros(())
+    if lam_grad > 0:
+        gxo, gyo = sobel_xy(luma(out))
+        gxt, gyt = sobel_xy(luma(target))
+        l_grad = (gxo - gxt).abs().mean() + (gyo - gyt).abs().mean()
+    return l_rec + lam_grad * l_grad, l_rec, l_grad
 
 
 def train(config):
@@ -83,9 +123,9 @@ def train(config):
                 m_target = mask_target(e_noisy, e_clean, config.mask_scale)
 
             out, m, _ = net.denoise(e_noisy, x_noisy)
-            loss_rec = F.l1_loss(out, e_clean)
+            loss_rec_total, loss_rec, loss_grad = recon_loss(out, e_clean, config.lam_edge, config.lam_grad)
             loss_mask = F.mse_loss(m, m_target)
-            loss = loss_rec + config.lam_mask * loss_mask
+            loss = loss_rec_total + config.lam_mask * loss_mask
 
             optimizer.zero_grad()
             loss.backward()
@@ -95,9 +135,9 @@ def train(config):
             if (it + 1) % config.display_iter == 0:
                 with torch.no_grad():
                     base = F.l1_loss(e_noisy, e_clean).item()
-                print("epoch %d iter %d | loss %.4f (rec %.4f, mask %.4f) | L1 before %.4f -> after %.4f"
-                      % (epoch, it + 1, loss.item(), loss_rec.item(), loss_mask.item(),
-                         base, loss_rec.item()))
+                print("epoch %d iter %d | loss %.4f (rec %.4f, grad %.4f, mask %.4f) | L1 before %.4f -> after %.4f"
+                      % (epoch, it + 1, loss.item(), loss_rec.item(), loss_grad.item(), loss_mask.item(),
+                         base, F.l1_loss(out, e_clean).item()))
 
         torch.save(net.denoiser.state_dict(),
                    os.path.join(config.snapshots_folder, "denoiser_epoch%d.pth" % epoch))
@@ -127,5 +167,9 @@ if __name__ == "__main__":
     parser.add_argument("--p_clean", type=float, default=0.2, help="노이즈를 넣지 않는 이미지 비율")
     # 손실 설정
     parser.add_argument("--lam_mask", type=float, default=0.1)
+    parser.add_argument("--lam_edge", type=float, default=0.0,
+                        help="경계 픽셀 L1 가중치 추가분 (0=사용 안 함, 예: 4면 경계에서 5배)")
+    parser.add_argument("--lam_grad", type=float, default=0.0,
+                        help="기울기 손실 가중치 (0=사용 안 함). 2026-11-17 실험에서는 오히려 경계를 흐리게 해서 비권장")
     parser.add_argument("--mask_scale", type=float, default=15.0, help="노이즈 크기 -> 마스크 정답 변환 배율")
     train(parser.parse_args())
