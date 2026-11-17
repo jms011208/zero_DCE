@@ -13,3 +13,14 @@ Zero-DCE(Zero-Reference Deep Curve Estimation)로 저조도 이미지의 밝기�
 %cd zero_DCE
 ```
 이후 데이터 다운로드 코드는 `zero_DCEob/04 데이터셋과 모델.md`의 "Colab에서 데이터 받기"를 실행하세요.
+
+## 노이즈 억제망 v2 (브랜치 `improve/denoise-net`)
+밝기 개선 때 증폭되는 노이즈를, DCE-Net 뒤에 붙인 소형 신경망(약 5.8k 파라미터)이 보정합니다. 설계와 결과는 `zero_DCEob/03 수정사항.md` 참고.
+```bash
+# 1) 노이즈 억제망 학습 (DCE-Net은 Epoch99.pth로 고정)
+python lowlight_train_v2.py --snapshots_folder snapshots/denoise_v1/ --num_epochs 30
+# 2) LOL eval15로 기존 Zero-DCE와 비교 (PSNR/SSIM)
+python eval_lol.py --lol_dir data/LOL/eval15 --denoise_weights snapshots/denoise_v1/denoiser_latest.pth
+# 3) 이미지 폴더에 적용 (--save_extra: 기존 결과와 노이즈 마스크도 저장)
+python lowlight_test_v2.py --input data/test_data/ --output data/result_v2/ --save_extra
+```
