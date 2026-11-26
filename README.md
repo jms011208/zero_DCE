@@ -24,3 +24,13 @@ python eval_lol.py --lol_dir data/LOL/eval15 --denoise_weights snapshots/denoise
 # 3) 이미지 폴더에 적용 (--save_extra: 기존 결과와 노이즈 마스크도 저장)
 python lowlight_test_v2.py --input data/test_data/ --output data/result_v2/ --save_extra
 ```
+
+## 노이즈 제거 방법 비교 (`compare_denoise.py`)
+같은 Zero-DCE 결과에 노이즈 억제 CNN과 고정 수식 필터(비지역 평균, 양방향, 가이디드, BM3D)를 각각 적용해 LOL eval15에서 같은 지표로 비교합니다.
+```bash
+pip install bm3d          # BM3D를 쓸 때만 (없으면 자동으로 건너뜀)
+python compare_denoise.py --cnn_weights snapshots/denoise_v1/denoiser_latest.pth --save_dir data/result_compare
+```
+- 지표: PSNR, SSIM, 경계 유지율(`edge_ratio`, 1=유지), 평평한 영역 밝기/색 노이즈(`flat_luma`, `flat_chroma`, 낮을수록 좋음), 처리 시간
+- `--adaptive`: 고정 필터를 많이 밝아진 곳일수록 강하게 적용
+- 이미지별 결과는 `data/result_compare/metrics.csv`에 저장
