@@ -7,6 +7,11 @@
   bilateral  : 양방향 필터 (OpenCV bilateralFilter)
   guided     : 가이디드 필터 (자체 구현, 채널별, E의 밝기를 안내 이미지로 사용)
   bm3d       : BM3D (pip install bm3d, 느림)
+  ycc_<필터> : 밝기/색 분리. 위 필터(nlm, bilateral, guided, bm3d)를 적용한 뒤
+               색(Cb, Cr)은 필터 결과를, 밝기(Y)는 기존 Zero-DCE 결과를 사용한다.
+               경계는 대부분 밝기에 있으므로 경계를 지키면서 색 노이즈만 지운다.
+               --ycc_luma 로 밝기에도 필터 결과를 일부 섞을 수 있다 (0=밝기 그대로, 1=일반 필터와 같음).
+               예) ycc_nlm, ycc_bilateral, ycc_guided, ycc_bm3d
 
 지표 (모두 정답 이미지 기준)
   PSNR, SSIM       : 높을수록 정답에 가까움 (밝기 차이의 영향이 큼)
@@ -18,6 +23,7 @@
 예)
   python compare_denoise.py --cnn_weights snapshots/denoise_v1/denoiser_latest.pth
   python compare_denoise.py --methods base,nlm,bilateral,guided --adaptive --save_dir data/result_compare
+  python compare_denoise.py --methods base,guided,ycc_guided,ycc_nlm --ycc_luma 0.3
 """
 import argparse
 import csv
@@ -34,7 +40,10 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 import model_v2
 from lowlight_test_v2 import list_images, load_image, pick_device
 
-ALL_METHODS = ["base", "cnn", "nlm", "bilateral", "guided", "bm3d"]
+FILTERS = ["nlm", "bilateral", "guided", "bm3d"]
+ALL_METHODS = ["base", "cnn"] + FILTERS + ["ycc_" + f for f in FILTERS]
+# 기본으로 실행할 방법 (ycc_bm3d는 느려서 직접 지정할 때만)
+DEFAULT_METHODS = ["base", "cnn"] + FILTERS + ["ycc_nlm", "ycc_bilateral", "ycc_guided"]
 
 
 # ---------------------------------------------------------------- 고정 수식 필터 (입력/출력: HxWx3 float32, 0~1)
@@ -89,6 +98,17 @@ def _luma_chroma(img):
     return y, 0.564 * (img[..., 2] - y), 0.713 * (img[..., 0] - y)
 
 
+def ycc_combine(base, filtered, luma=0.0):
+    """밝기(Y)는 base와 filtered를 luma 비율로 섞고, 색(Cb, Cr)은 filtered를 쓴다. HxWx3, 0~1."""
+    yb, _, _ = _luma_chroma(base)
+    yf, cbf, crf = _luma_chroma(filtered)
+    y = (1.0 - luma) * yb + luma * yf
+    r = y + 1.403 * crf
+    g = y - 0.344 * cbf - 0.714 * crf
+    b = y + 1.773 * cbf
+    return np.stack([r, g, b], axis=-1).clip(0, 1).astype(np.float32)
+
+
 def _highpass(ch):
     return ch - cv2.blur(ch, (5, 5), borderType=cv2.BORDER_REPLICATE)
 
@@ -130,12 +150,15 @@ def main(cfg):
     if "cnn" in methods and not cfg.cnn_weights:
         print("[안내] --cnn_weights 가 없어 cnn은 건너뜁니다.")
         methods.remove("cnn")
-    if "bm3d" in methods:
+    if "cnn" in methods and not os.path.exists(cfg.cnn_weights):
+        print("[안내] CNN 가중치 파일이 없어 cnn은 건너뜁니다: %s" % cfg.cnn_weights)
+        methods.remove("cnn")
+    if any(m in ("bm3d", "ycc_bm3d") for m in methods):
         try:
             import bm3d  # noqa: F401
         except ImportError:
-            print("[안내] bm3d 패키지가 없어 건너뜁니다. (pip install bm3d)")
-            methods.remove("bm3d")
+            print("[안내] bm3d 패키지가 없어 bm3d, ycc_bm3d는 건너뜁니다. (pip install bm3d)")
+            methods = [m for m in methods if m not in ("bm3d", "ycc_bm3d")]
 
     net = model_v2.enhance_net_denoise(ch=cfg.channels).to(device)
     net.load_dce(cfg.dce_weights, map_location=device)
@@ -156,8 +179,8 @@ def main(cfg):
     files = list_images(low_dir)
     if cfg.limit > 0:
         files = files[:cfg.limit]
-    print("device: %s | images: %d | methods: %s | adaptive: %s"
-          % (device, len(files), ",".join(methods), cfg.adaptive))
+    print("device: %s | images: %d | methods: %s | adaptive: %s | ycc_luma: %.2f"
+          % (device, len(files), ",".join(methods), cfg.adaptive, cfg.ycc_luma))
 
     for path in files:
         name = os.path.basename(path)
@@ -176,6 +199,7 @@ def main(cfg):
         # 많이 밝아진 곳일수록 강하게 적용하기 위한 가중치 (--adaptive)
         w = ((gain - gain.min()) / (gain.max() - gain.min() + 1e-8))[..., None].astype(np.float32)
 
+        cache = {}  # 같은 필터를 일반/ycc에서 두 번 계산하지 않도록 (시간은 각각 따로 기록)
         for mth in methods:
             t0 = time.time()
             if mth == "base":
@@ -185,7 +209,13 @@ def main(cfg):
                     o, _, _ = net.denoise(e_t, x)
                 out = to_np(o)
             else:
-                out = filters[mth](base)
+                fname = mth[4:] if mth.startswith("ycc_") else mth
+                if fname not in cache:
+                    tf = time.time()
+                    cache[fname] = (filters[fname](base), time.time() - tf)
+                filtered, f_sec = cache[fname]
+                t0 = time.time() - f_sec  # 캐시를 써도 필터 시간은 포함
+                out = ycc_combine(base, filtered, cfg.ycc_luma) if mth.startswith("ycc_") else filtered
                 if cfg.adaptive:
                     out = (1 - w) * base + w * out
             sec = time.time() - t0  # 노이즈 제거 단계만의 시간 (Zero-DCE 시간 제외)
@@ -201,11 +231,11 @@ def main(cfg):
 
     keys = ["psnr", "ssim", "edge_ratio", "flat_luma", "flat_chroma", "sec"]
     print()
-    print("%-10s %8s %8s %11s %10s %12s %8s" % ("method", "PSNR", "SSIM", "edge_ratio", "flat_luma", "flat_chroma", "sec"))
+    print("%-14s %8s %8s %11s %10s %12s %8s" % ("method", "PSNR", "SSIM", "edge_ratio", "flat_luma", "flat_chroma", "sec"))
     for mth in methods:
         rs = [r for r in rows if r["method"] == mth]
         mean = [np.mean([r[k] for r in rs]) for k in keys]
-        print("%-10s %8.3f %8.4f %11.3f %10.2f %12.2f %8.2f" % ((mth,) + tuple(mean)))
+        print("%-14s %8.3f %8.4f %11.3f %10.2f %12.2f %8.2f" % ((mth,) + tuple(mean)))
     print("\n(n=%d) edge_ratio: 1=경계 유지, 작을수록 흐려짐 | flat_*: 평평한 영역 노이즈(x1000), 낮을수록 좋음"
           % len({r["image"] for r in rows}))
 
@@ -225,7 +255,10 @@ if __name__ == "__main__":
     p.add_argument("--dce_weights", type=str, default="snapshots/Epoch99.pth")
     p.add_argument("--cnn_weights", type=str, default="snapshots/denoise_v1/denoiser_latest.pth")
     p.add_argument("--channels", type=int, default=16)
-    p.add_argument("--methods", type=str, default=",".join(ALL_METHODS))
+    p.add_argument("--methods", type=str, default=",".join(DEFAULT_METHODS),
+                   help="쉼표로 구분. 가능: " + ",".join(ALL_METHODS))
+    p.add_argument("--ycc_luma", type=float, default=0.0,
+                   help="ycc_* 방법에서 밝기에 필터 결과를 섞는 비율 (0=밝기 그대로, 1=일반 필터와 같음)")
     p.add_argument("--adaptive", action="store_true",
                    help="고정 수식 필터를 많이 밝아진 곳일수록 강하게 적용 (gain 맵으로 섞기)")
     p.add_argument("--limit", type=int, default=0, help="앞에서부터 N장만 (0=전체)")

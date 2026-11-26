@@ -33,4 +33,5 @@ python compare_denoise.py --cnn_weights snapshots/denoise_v1/denoiser_latest.pth
 ```
 - 지표: PSNR, SSIM, 경계 유지율(`edge_ratio`, 1=유지), 평평한 영역 밝기/색 노이즈(`flat_luma`, `flat_chroma`, 낮을수록 좋음), 처리 시간
 - `--adaptive`: 고정 필터를 많이 밝아진 곳일수록 강하게 적용
+- `ycc_nlm`, `ycc_bilateral`, `ycc_guided`, `ycc_bm3d`: 밝기는 Zero-DCE 결과 그대로 두고 색(Cb, Cr) 노이즈만 필터로 제거 (`--ycc_luma`로 밝기에 필터를 섞는 비율 조절)
 - 이미지별 결과는 `data/result_compare/metrics.csv`에 저장
